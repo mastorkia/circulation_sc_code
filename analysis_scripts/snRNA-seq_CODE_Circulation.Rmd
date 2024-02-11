@@ -5,13 +5,13 @@ output: html_document
 date: "2023-01-28"
 ---
 
-#Load needed libraries.
 ```{r}
 install.packages("/Users/mastorkia/Dropbox (EinsteinMed)/RISC_versions/RISC_1.6.0.tar.gz", repos = NULL, type = "source")
 ```
 
 
 ```{r, echo=F, message=F}
+#Load needed libraries.
 library(Seurat)
 library(RISC)
 library(data.table)
@@ -24,40 +24,38 @@ library(edgeR)
 library(ggalluvial)
 ```
 
-#Load matrices and start creating SEURAT objects necessary for double removal.
 ```{r}
-#Function to just create the objects and violin plot so then we can filter them accordingly.
+#Load matrices and start creating SEURAT objects necessary for double removal.
 infart_sample_list <- c("Control1n2","Control3n4","Heart1n2","Heart3n4","Heart5")
 ```
 
 ```{r}
 create_object<- function(sample_list){
-Dataset <- Read10X(data.dir =paste0("/path_to_cellranger_output/",sample_list, "_filtered_feature_bc_matrix/"))
+  Dataset <- Read10X(data.dir =paste0("/path_to_cellranger_output/",sample_list, "_filtered_feature_bc_matrix/"))
 
-# Initialize the WT_object object with the raw (non-normalized data).
-Object <- CreateSeuratObject(counts = Dataset, project = paste0(sample_list), min.cells = 3, min.features = 200)
+  # Initialize the WT_object object with the raw (non-normalized data).
+  Object <- CreateSeuratObject(counts = Dataset, project = paste0(sample_list), min.cells = 3, min.features = 200)
 
-Object[["percent.mt"]] <- PercentageFeatureSet(Object, pattern = "^mt-")
+  Object[["percent.mt"]] <- PercentageFeatureSet(Object, pattern = "^mt-")
 
  png(file =paste0(sample_list,"_nCount_violin.png"),  
       width = 1000,
       height = 1200)
-counts_violin <- VlnPlot(Object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+  counts_violin <- VlnPlot(Object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
 
-print(counts_violin)
-dev.off()
-return(Object)
+  print(counts_violin)
+  dev.off()
+  return(Object)
 }
 ```
 
 
 ```{r}
 Object_list <- mapply(FUN=create_object,infart_sample_list)
-
 ```
 
-#Filter each object accordingly.
 ```{r}
+#Filter each object accordingly.
 Object_list$Control1n2 <- subset(Object_list$Control1n2, subset = nCount_RNA < 60000 & percent.mt < 10, nFeature_RNA > 2000)
 Object_list$Control1n2
 
@@ -74,44 +72,45 @@ Object_list$Heart5 <- subset(Object_list$Heart5, subset = nCount_RNA < 100000 & 
 Object_list$Heart5
 ```
 
-#We need to normalize and dim reduction to run Doublet finder. This needs to be done if not doublet finder doesnt work.
 ```{r}
+#Normalize and dim reduction to run Doublet finder.
 normalize_function <- function(Object_list){
-Object_list <- NormalizeData(Object_list)
-Object_list <- FindVariableFeatures(Object_list, selection.method = "vst", nfeatures = 2000)
-Object_list <- ScaleData(Object_list)
-Object_list <- RunPCA(Object_list)
-Object_list <- FindNeighbors(Object_list, dims = 1:20)
-Object_list <- FindClusters(Object_list, resolution = 0.2)
-Object_list <- RunUMAP(Object_list, dims = 1:20)
+  Object_list <- NormalizeData(Object_list)
+  Object_list <- FindVariableFeatures(Object_list, selection.method = "vst", nfeatures = 2000)
+  Object_list <- ScaleData(Object_list)
+  Object_list <- RunPCA(Object_list)
+  Object_list <- FindNeighbors(Object_list, dims = 1:20)
+  Object_list <- FindClusters(Object_list, resolution = 0.2)
+  Object_list <- RunUMAP(Object_list, dims = 1:20)
 }
 
 Object_list <- mapply(FUN=normalize_function,Object_list)
 ```
 
-#Now we will run the doubletfinder removal package.
+
 ```{r}
+#Run the doubletfinder removal package.
 #It need to be normalized by SCT.
 doublet_finder <- function(seurat){
-seurat <- SCTransform(seurat)
+  seurat <- SCTransform(seurat)
 
-sweep.res.list <- paramSweep_v3(seurat, PCs = 1:20, sct = T)
+  sweep.res.list <- paramSweep_v3(seurat, PCs = 1:20, sct = T)
 
-sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
-bcmvn <- find.pK(sweep.stats)
-maxscorepk <- bcmvn[bcmvn$BCmetric == max(bcmvn$BCmetric),2]
-maxscorepk <- as.numeric( levels(maxscorepk)[maxscorepk] )
+  sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  maxscorepk <- bcmvn[bcmvn$BCmetric == max(bcmvn$BCmetric),2]
+  maxscorepk <- as.numeric( levels(maxscorepk)[maxscorepk] )
 
-load("dratedf.rda")
-#And run linear regression to stimate drouplets based on number of cells.
-dbmodel <- lm(MultipletRate ~ CellsRecovered, data = dratedf)
-predicteddoubletrate <- as.numeric((dbmodel$coefficients['CellsRecovered'] * ncol(seurat)) + dbmodel$coefficients[1])
+  load("dratedf.rda")
+  #And run linear regression to stimate drouplets based on number of cells.
+  dbmodel <- lm(MultipletRate ~ CellsRecovered, data = dratedf)
+  predicteddoubletrate <- as.numeric((dbmodel$coefficients['CellsRecovered'] * ncol(seurat)) + dbmodel$coefficients[1])
 
-homotypicprop <- modelHomotypic(as.vector(seurat@meta.data[,"seurat_clusters"]))
-nexppoi <- round(predicteddoubletrate * length(rownames(seurat@meta.data)))
-nexppoiadj <- round(nexppoi * (1 - homotypicprop))
+  homotypicprop <- modelHomotypic(as.vector(seurat@meta.data[,"seurat_clusters"]))
+  nexppoi <- round(predicteddoubletrate * length(rownames(seurat@meta.data)))
+  nexppoiadj <- round(nexppoi * (1 - homotypicprop))
 
-seurat <-doubletFinder_v3(seu = seurat, PCs = 1:20, pN = 0.25, pK = maxscorepk, nExp = nexppoiadj, sct = T)
+  seurat <-doubletFinder_v3(seu = seurat, PCs = 1:20, pN = 0.25, pK = maxscorepk, nExp = nexppoiadj, sct = T)
 }
 ```
 
@@ -128,30 +127,30 @@ Object_list$Heart3n4 <- doublet_finder(Object_list$Heart3n4)
 Object_list$Heart5 <- doublet_finder(Object_list$Heart5)
 ```
 
-#Now lets remove the cells identified as doublets.
 ```{r}
+#Remove the cells identified as doublets.
 remove_doublets <- function(Object){
-no_double_cells <-Object@meta.data %>% filter(!.[[ncol(Object@meta.data)]]=="Doublet") %>% rownames()
-Object <- Object[,no_double_cells]
+  no_double_cells <-Object@meta.data %>% filter(!.[[ncol(Object@meta.data)]]=="Doublet") %>% rownames()
+  Object <- Object[,no_double_cells]
 }
 
 Object_list <- mapply(FUN=remove_doublets,Object_list)
 ```
 
-#Now create RISC objects to run integration.
+
 ```{r}
+#Create RISC objects to run integration.
 create_risc <- function(Object){
-#Now create RISC object with new matrix and coldata and save it.
-mat <- as.matrix(Object@assays$RNA@counts)#this step gices problem because of the size of the matrix. Has to be done in the server
-coldata <- Object@meta.data
-rowdata <- data.frame(Symbol = rownames(mat), row.names = rownames(mat))
-Object <- readsc(mat, coldata, rowdata, is.filter = T)
-return(Object)
+  #Now create RISC object with new matrix and coldata and save it.
+  mat <- as.matrix(Object@assays$RNA@counts)#this step gices problem because of the size of the matrix. Has to be done in the server
+  coldata <- Object@meta.data
+  rowdata <- data.frame(Symbol = rownames(mat), row.names = rownames(mat))
+  Object <- readsc(mat, coldata, rowdata, is.filter = T)
+  return(Object)
 }
 
 ```
 
-#Create new RISC objects
 ```{r}
 Object_RISC <- mapply(FUN=create_risc,Object_list)
 ```
@@ -159,58 +158,61 @@ Object_RISC <- mapply(FUN=create_risc,Object_list)
 #Save all the filtered RISC objects
 ```{r}
 save_risc <- function(object,infart_sample_list){
-saveRDS(object, file = paste0("RISC_Objects/",infart_sample_list, "_RISC.rds"))
+  saveRDS(object, file = paste0("RISC_Objects/",infart_sample_list, "_RISC.rds"))
 }
 mapply(FUN=save_risc,Object_RISC,infart_sample_list)
 ```
 
-#Lets normalize and find variable genes.
+#Normalize and find variable genes.
 ```{r}
 process0 <- function(obj0){
-#Filter. It is necessary again
-obj0 = scFilter(obj0, min.UMI = 10, max.UMI = Inf, min.gene = 1, min.cell = 1)
-# Normalize the raw counts
-obj0 = scNormalize(obj0, ncore = 4)
-# Find highly variable genes
-obj0 = scDisperse(obj0)
-# print(length(obj0@vargene))
-return(obj0)
+  #Filter. It is necessary again
+  obj0 = scFilter(obj0, min.UMI = 10, max.UMI = Inf, min.gene = 1, min.cell = 1)
+  # Normalize the raw counts
+  obj0 = scNormalize(obj0, ncore = 4)
+  # Find highly variable genes
+  obj0 = scDisperse(obj0)
+  # print(length(obj0@vargene))
+  return(obj0)
 }
 ```
 
 ```{r}
 Object_RISC <- mapply(FUN=process0,Object_RISC)
 ```
-#Check which of the datatsets to use as reference.
+
 ```{r}
+#Check which of the datatsets to use as reference.
 var0 = Reduce(
-intersect, list(
-Object_RISC$Control1n2@rowdata$Symbol, Object_RISC$Control3n4@rowdata$Symbol, Object_RISC$Heart1n2@rowdata$Symbol, Object_RISC$Heart3n4@rowdata$Symbol,
+  intersect, list(
+  Object_RISC$Control1n2@rowdata$Symbol, Object_RISC$Control3n4@rowdata$Symbol, Object_RISC$Heart1n2@rowdata$Symbol, Object_RISC$Heart3n4@rowdata$Symbol,
 Object_RISC$Heart5@rowdata$Symbol 
-)
+  )
 )
 
 InPlot(Object_RISC, var.gene = var0, Std.cut = 0.99, ncore = 4, minPC = 16, nPC = 20)
 ```
-#Following RISC instructions we decide Heart1n2 woukd be the reference.
 
+#Use Heart1n2 woukd be the reference.
 ```{r}
 set.seed(123)
 #List to integrate the data. In this case we use Heart1n2 as reference.
 Merge_list = list(Object_RISC$Heart1n2, Object_RISC$Heart3n4, Object_RISC$Heart5, Object_RISC$Control3n4, Object_RISC$Control1n2)
 ```
 
-#Integrate everything
+
 ```{r}
+#Integrate 
 Integration_Ids <- c("Heart1n2", "Heart3n4", "Heart5", "Control3n4", "Control1n2")
 Merge_Object = scMultiIntegrate(
-objects = Merge_list, eigens = 20, add.Id = Integration_Ids, var.gene = var0,
+  objects = Merge_list, eigens = 20, add.Id = Integration_Ids, var.gene = var0,
 align = 'OLS', npc = 50, adjust = TRUE, ncore = 4
 )
 ```
 
-#Since we have already orig.indentity column from Seurat, lets rename values in Set (from RISC) and create a condition colunm.
+
 ```{r}
+#Add condition colunm.
 Merge_Object@coldata <- Merge_Object@coldata %>% rename(Condition=Set)
 Merge_Object@coldata <- Merge_Object@coldata %>% rename(Set=orig.ident)
 
@@ -227,8 +229,9 @@ Merge_Object@coldata$Condition[Merge_Object@coldata$Condition=="Control3n4"] <- 
 saveRDS(Merge_Object, file = paste0("RISC_Objects/Merged_RISC.rds"))
 ```
 
-#Run UMAP reduction and clustering and plot
+
 ```{r}
+#Run UMAP reduction and clustering
 Merge_Object = scPCA(Merge_Object, npc = 20)
 Merge_Object = scUMAP(Merge_Object, npc = 20, use = "PLS")
 Merge_Object = scCluster(Merge_Object, slot = "cell.pls", neighbor = 12, method = "louvain", npc = 20)
@@ -240,8 +243,9 @@ DimPlot(Merge_Object, slot = "cell.umap", colFactor = "Cluster")
 ```
 
 
-#Subset each sample and plot integration.
+
 ```{r}
+#Subset each sample and plot integration.
 plot_each_samples <- function(sample){
   sample_cells <- Merge_Object@coldata %>% filter(orig.ident==sample) %>% rownames()
   subset_object <- SubSet(Merge_Object, cells = sample_cells)
@@ -263,19 +267,18 @@ plot_each_samples("Control1n2")
 
 ```
 
-#Since we have a separated cluster (of 31 cells) we need to remove it from the beginning and rerun everything. Will do is manually give them a new cluster assignation based on umap coordinates.
+#Since we have a separated cluster (of 31 cells) we need to remove it from the beginning and rerun everything. Will do this manually using UMAP coordinates. 
 ```{r}
 umap_first_integration <- as.data.frame(Merge_Object@DimReduction$cell.umap)
 
 cell_to_remove <- umap_first_integration %>% filter(UMAP2 < -20) %>% rownames()
 ```
 
-#Just create a new object (we could keep working on the original but just in case).
 ```{r}
 Object_RISC2 <- Object_RISC
 ```
 
-#Lets subset from Object_RISC2.
+#Subset these cells from object.
 ```{r}
 remove <- cell_to_remove[grep("Heart1n2",cell_to_remove)]
 remove<- stringr::str_remove(remove, "Heart1n2_")
@@ -310,17 +313,17 @@ Object_RISC2$Control3n4 <- SubSet(Object_RISC2$Control3n4, cells = keep)
 ```
 
 
-#Run everything again.
+#Rerun integration again.
 ```{r}
 process0 <- function(obj0){
-#Filter. It is necessary again
-obj0 = scFilter(obj0, min.UMI = 10, max.UMI = Inf, min.gene = 1, min.cell = 1)
-# Normalize the raw counts
-obj0 = scNormalize(obj0, ncore = 4)
-# Find highly variable genes
-obj0 = scDisperse(obj0)
-# print(length(obj0@vargene))
-return(obj0)
+  #Filter. It is necessary again
+  obj0 = scFilter(obj0, min.UMI = 10, max.UMI = Inf, min.gene = 1, min.cell = 1)
+  # Normalize the raw counts
+  obj0 = scNormalize(obj0, ncore = 4)
+  # Find highly variable genes
+  obj0 = scDisperse(obj0)
+  # print(length(obj0@vargene))
+  return(obj0)
 }
 
 Object_RISC2 <- mapply(FUN=process0,Object_RISC2)
@@ -329,9 +332,9 @@ Object_RISC2 <- mapply(FUN=process0,Object_RISC2)
 ```{r}
 var0 = Reduce(
 intersect, list(
-Object_RISC2$Control1n2@rowdata$Symbol, Object_RISC2$Control3n4@rowdata$Symbol, Object_RISC2$Heart1n2@rowdata$Symbol, Object_RISC2$Heart3n4@rowdata$Symbol,
+  Object_RISC2$Control1n2@rowdata$Symbol, Object_RISC2$Control3n4@rowdata$Symbol, Object_RISC2$Heart1n2@rowdata$Symbol, Object_RISC2$Heart3n4@rowdata$Symbol,
 Object_RISC2$Heart5@rowdata$Symbol 
-)
+  )
 )
 
 InPlot(Object_RISC2, var.gene = var0, Std.cut = 0.99, ncore = 4, minPC = 16, nPC = 20)
@@ -340,7 +343,7 @@ InPlot(Object_RISC2, var.gene = var0, Std.cut = 0.99, ncore = 4, minPC = 16, nPC
 
 ```{r}
 set.seed(123)
-#List to integrate the data. In this case we use Heart1n2 as reference.
+#Use Heart1n2 as reference.
 Merge_list = list(Object_RISC2$Heart1n2, Object_RISC2$Heart3n4, Object_RISC2$Heart5, Object_RISC2$Control3n4, Object_RISC2$Control1n2)
 ```
 
@@ -348,7 +351,7 @@ Merge_list = list(Object_RISC2$Heart1n2, Object_RISC2$Heart3n4, Object_RISC2$Hea
 ```{r}
 Integration_Ids <- c("Heart1n2", "Heart3n4", "Heart5", "Control3n4", "Control1n2")
 Merge2_Object = scMultiIntegrate(
-objects = Merge_list, eigens = 20, add.Id = Integration_Ids, var.gene = var0,
+  objects = Merge_list, eigens = 20, add.Id = Integration_Ids, var.gene = var0,
 align = 'OLS', npc = 50, adjust = TRUE, ncore = 4
 )
 ```
@@ -367,8 +370,9 @@ Merge2_Object@coldata$Condition[Merge2_Object@coldata$Condition=="Control3n4"] <
 saveRDS(Merge2_Object, file = paste0("RISC_Objects/Merged2_RISC.rds"))
 ```
 
-#Lets run UMAP reduction.
+
 ```{r}
+#Run UMAP reduction.
 Merge2_Object = scUMAP(Merge2_Object, npc = 20, use = "PLS")
 
 Merge2_Object = scCluster(Merge2_Object, slot = "cell.pls", neighbor = 12, method = "louvain", npc = 20)
@@ -377,8 +381,9 @@ print(table(Merge2_Object@coldata$Cluster))
 DimPlot(Merge2_Object, slot = "cell.umap", colFactor = "Cluster")
 ```
 
-#In order to plot Control and Hearts UMAP I need to subset the data. Cluster 2 is not present in Contorl so it will fail when plotting by colors. Change one of the cells in Control to Cluster 2.
+
 ```{r}
+#In order to plot Control and Hearts UMAP I need to subset the data. Cluster 2 is not present in Contorl so it will fail when plotting by colors. Change one of the cells in Control to Cluster 2.
 Merge2_Object@coldata["Control1n2_GCCAGCATCGATTCCC-1",]$Cluster <- 2
 Merge2_Object@coldata["Control3n4_TGAGCGCAGAAGCCTG-1",]$Cluster <- 2
 ```
@@ -435,9 +440,9 @@ integration_draw_heatmap <- function(dataframe,obejct){
   dataframe %>%
     group_by(Cluster) %>%
     top_n(n = 10, wt = log2FC) -> top5
-plot <- Heat(obejct, colFactor = "Cluster",genes  = top5$Symbol, smooth="smooth", gene.lab = T,  num=10, gene.lab.size = 10) 
-print(plot)
-dev.off()
+  plot <- Heat(obejct, colFactor = "Cluster",genes  = top5$Symbol, smooth="smooth", gene.lab = T,  num=10, gene.lab.size = 10) 
+  print(plot)
+  dev.off()
 }
 integration_draw_heatmap(Integrated2_markers,Merge2_Object)
 ```
@@ -489,7 +494,7 @@ Nikolaos_Integrated2_DE <- DE_function("Control","Infart")
 ```
 
 
-#Run DE as pseudo-bulk RNAseq using edgeR. For that create a new count table summing cells coming from same sample. Since RISC doesnt save raw data I need to go back to seurat and subset the data again.
+#Run DE as pseudo-bulk RNAseq using edgeR. For that create a new count table summing cells coming from same sample. Since RISC doesnt save raw data go back to seurat and subset the data again.
 #Raw counts (doublets are removed). We need to remove only those cells that were in a separated cluster.
 ```{r}
 raw_control1n2 <- Object_list$Control1n2@assays$RNA@counts
@@ -507,25 +512,25 @@ Merge2_metadata <- Merge2_Object@coldata
 #Create function to remove cells and then get a df with sample and celltype.
 ```{r}
 pseudo_bulk_df <- function(sample,raw_counts_sample){
-remove <- cell_to_remove[grep(paste0(sample,"_"),cell_to_remove)]
-remove<- stringr::str_remove(remove, paste0(sample,"_"))
-raw_counts_sample <- raw_counts_sample[, !(colnames(raw_counts_sample) %in% remove)]
-subset_metadata <- Merge2_metadata %>% filter(Set==sample)
-sample_pseudo_bulk <- as.data.frame(rownames(raw_counts_sample))
-  for ( i in unique(subset_metadata$Cluster)){
-    cell_clusters <- subset_metadata %>% filter(Cluster==i) %>% select(scBarcode)
-    cell_clusters <- cell_clusters$scBarcode
+  remove <- cell_to_remove[grep(paste0(sample,"_"),cell_to_remove)]
+  remove<- stringr::str_remove(remove, paste0(sample,"_"))
+  raw_counts_sample <- raw_counts_sample[, !(colnames(raw_counts_sample) %in% remove)]
+  subset_metadata <- Merge2_metadata %>% filter(Set==sample)
+  sample_pseudo_bulk <- as.data.frame(rownames(raw_counts_sample))
+    for ( i in unique(subset_metadata$Cluster)){
+      cell_clusters <- subset_metadata %>% filter(Cluster==i) %>% select(scBarcode)
+      cell_clusters <- cell_clusters$scBarcode
       if( isTRUE(length(cell_clusters) > 1)){
-      subseted_raw <- raw_counts_sample[,cell_clusters]
-      #subseted_raw <- as.data.frame(subseted_raw)
-      Cluster_sum <- as.data.frame(rowSums(subseted_raw))
-      Cluster_sum <- Cluster_sum %>% dplyr::rename(!!paste0(sample,"_Cluster",i) := 1)
-      rownames(Cluster_sum) <- NULL
-      #print(colnames(Cluster_sum))
-      sample_pseudo_bulk <- cbind(sample_pseudo_bulk,Cluster_sum)
-      }
-  }
-return(sample_pseudo_bulk)
+        subseted_raw <- raw_counts_sample[,cell_clusters]
+        #subseted_raw <- as.data.frame(subseted_raw)
+        Cluster_sum <- as.data.frame(rowSums(subseted_raw))
+        Cluster_sum <- Cluster_sum %>% dplyr::rename(!!paste0(sample,"_Cluster",i) := 1)
+        rownames(Cluster_sum) <- NULL
+        #print(colnames(Cluster_sum))
+        sample_pseudo_bulk <- cbind(sample_pseudo_bulk,Cluster_sum)
+        }
+    }
+  return(sample_pseudo_bulk)
 }
 ```
 
@@ -541,8 +546,9 @@ Heart3n4_pseudo_bulk <- pseudo_bulk_df("Heart3n4", raw_heart3n4)
 Heart5_pseudo_bulk <- pseudo_bulk_df("Heart5", raw_heart5)
 
 ```
-#Now bind all df
+
 ```{r}
+#Now bind all df
 all_psuedo_list <- list(Control1n2_pseudo_bulk,Control3n4_pseudo_bulk,Heart1n2_pseudo_bulk,Heart3n4_pseudo_bulk,Heart5_pseudo_bulk)
 ```
 
@@ -553,8 +559,9 @@ rownames(all_pseudo_bulk_counts) <- all_pseudo_bulk_counts$`rownames(raw_counts_
 all_pseudo_bulk_counts$`rownames(raw_counts_sample)` <- NULL
 write.csv(all_pseudo_bulk_counts, "Pseudo_bulk_raw_counts.csv", row.names = T)
 ```
-#Remove Cluster2, Cluster7, Cluster8  Cluster9 and Cluster11 because tehere is not enougth data for Controls.
+
 ```{r}
+#Remove Cluster2, Cluster7, Cluster8  Cluster9 and Cluster11 because tehere is not enougth data for Controls.
 subset_pseudo_bulk <- all_pseudo_bulk_counts %>% select(-contains(c("Cluster2","Cluster7","Cluster8","Cluster9", "Cluster11")))
 
 ```
@@ -590,7 +597,6 @@ edgeR_cluster <- function(Cluster_name){
 
 ```
 
-#Now create the metadata table to create edgeR object.
 ```{r}
 Cluster1_pseudo_bulk_DE <- edgeR_cluster("Cluster1")
 Cluster3_pseudo_bulk_DE <- edgeR_cluster("Cluster3")
@@ -612,7 +618,7 @@ DE_psuedo_bulk <- do.call(rbind,pseudo_bulk_de_list)
 write.csv(DE_psuedo_bulk, "DE2_psuedo_bulk_Infart.csv", row.names = T, col.names = T)
 ```
 
-# 2 UMAP fromc ontrols samples and infarts.
+# 2 UMAP from controls samples and infarts.
 ```{r}
 for(i in unique(Merge2_Object@coldata$Condition)){
   sample_cells <- Merge2_Object@coldata %>% filter(Condition==i) %>% rownames()
@@ -627,16 +633,17 @@ for(i in unique(Merge2_Object@coldata$Condition)){
 }
 ```
 
-#We need information of UMAP coordinates to run scvelo and cellrank.
 ```{r}
+#UMAP coordinates to run scvelo and cellrank.
 metadata_file <- Merge2_Object@coldata
 metadata_file$UMAP1 <- (Merge2_Object@DimReduction$cell.umap)[,1]
 metadata_file$UMAP2 <- (Merge2_Object@DimReduction$cell.umap)[,2]
 write.csv(metadata_file, "Infart_RISC_metadata.csv")
 ```
 
-#Plot top 5 markers data.
+
 ```{r}
+#Plot top 5 markers data.
 Integrated2_markers %>%
   group_by(Cluster) %>%
   top_n(n = 5, wt = log2FC) -> Integrated2_markers_top5
