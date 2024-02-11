@@ -1,0 +1,648 @@
+---
+title: Cardiac pericytes contribute to myofibroblast expansion and vascular maturation
+  following myocardial infarction
+output: html_document
+date: "2023-01-28"
+---
+
+#Load needed libraries.
+```{r}
+install.packages("/Users/mastorkia/Dropbox (EinsteinMed)/RISC_versions/RISC_1.6.0.tar.gz", repos = NULL, type = "source")
+```
+
+
+```{r, echo=F, message=F}
+library(Seurat)
+library(RISC)
+library(data.table)
+library(Matrix)
+library(ggplot2)
+library(RColorBrewer)
+library(DoubletFinder)
+library(dplyr)
+library(edgeR)
+library(ggalluvial)
+```
+
+#Load matrices and start creating SEURAT objects necessary for double removal.
+```{r}
+#Function to just create the objects and violin plot so then we can filter them accordingly.
+infart_sample_list <- c("Control1n2","Control3n4","Heart1n2","Heart3n4","Heart5")
+```
+
+```{r}
+create_object<- function(sample_list){
+Dataset <- Read10X(data.dir =paste0("/path_to_cellranger_output/",sample_list, "_filtered_feature_bc_matrix/"))
+
+# Initialize the WT_object object with the raw (non-normalized data).
+Object <- CreateSeuratObject(counts = Dataset, project = paste0(sample_list), min.cells = 3, min.features = 200)
+
+Object[["percent.mt"]] <- PercentageFeatureSet(Object, pattern = "^mt-")
+
+ png(file =paste0(sample_list,"_nCount_violin.png"),  
+      width = 1000,
+      height = 1200)
+counts_violin <- VlnPlot(Object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+print(counts_violin)
+dev.off()
+return(Object)
+}
+```
+
+
+```{r}
+Object_list <- mapply(FUN=create_object,infart_sample_list)
+
+```
+
+#Filter each object accordingly.
+```{r}
+Object_list$Control1n2 <- subset(Object_list$Control1n2, subset = nCount_RNA < 60000 & percent.mt < 10, nFeature_RNA > 2000)
+Object_list$Control1n2
+
+Object_list$Control3n4 <- subset(Object_list$Control3n4, subset = nCount_RNA < 50000 & percent.mt < 10, nFeature_RNA > 2000)
+Object_list$Control3n4
+
+Object_list$Heart1n2 <- subset(Object_list$Heart1n2, subset = nCount_RNA < 70000 & percent.mt < 10, nFeature_RNA > 2000)
+Object_list$Heart1n2
+
+Object_list$Heart3n4 <- subset(Object_list$Heart3n4, subset = nCount_RNA < 100000 & percent.mt < 10, nFeature_RNA > 2000)
+Object_list$Heart3n4
+
+Object_list$Heart5 <- subset(Object_list$Heart5, subset = nCount_RNA < 100000 & percent.mt < 10, nFeature_RNA > 2000)
+Object_list$Heart5
+```
+
+#We need to normalize and dim reduction to run Doublet finder. This needs to be done if not doublet finder doesnt work.
+```{r}
+normalize_function <- function(Object_list){
+Object_list <- NormalizeData(Object_list)
+Object_list <- FindVariableFeatures(Object_list, selection.method = "vst", nfeatures = 2000)
+Object_list <- ScaleData(Object_list)
+Object_list <- RunPCA(Object_list)
+Object_list <- FindNeighbors(Object_list, dims = 1:20)
+Object_list <- FindClusters(Object_list, resolution = 0.2)
+Object_list <- RunUMAP(Object_list, dims = 1:20)
+}
+
+Object_list <- mapply(FUN=normalize_function,Object_list)
+```
+
+#Now we will run the doubletfinder removal package.
+```{r}
+#It need to be normalized by SCT.
+doublet_finder <- function(seurat){
+seurat <- SCTransform(seurat)
+
+sweep.res.list <- paramSweep_v3(seurat, PCs = 1:20, sct = T)
+
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+maxscorepk <- bcmvn[bcmvn$BCmetric == max(bcmvn$BCmetric),2]
+maxscorepk <- as.numeric( levels(maxscorepk)[maxscorepk] )
+
+load("dratedf.rda")
+#And run linear regression to stimate drouplets based on number of cells.
+dbmodel <- lm(MultipletRate ~ CellsRecovered, data = dratedf)
+predicteddoubletrate <- as.numeric((dbmodel$coefficients['CellsRecovered'] * ncol(seurat)) + dbmodel$coefficients[1])
+
+homotypicprop <- modelHomotypic(as.vector(seurat@meta.data[,"seurat_clusters"]))
+nexppoi <- round(predicteddoubletrate * length(rownames(seurat@meta.data)))
+nexppoiadj <- round(nexppoi * (1 - homotypicprop))
+
+seurat <-doubletFinder_v3(seu = seurat, PCs = 1:20, pN = 0.25, pK = maxscorepk, nExp = nexppoiadj, sct = T)
+}
+```
+
+
+```{r}
+Object_list$Control1n2 <- doublet_finder(Object_list$Control1n2)
+
+Object_list$Control3n4 <- doublet_finder(Object_list$Control3n4)
+
+Object_list$Heart1n2 <- doublet_finder(Object_list$Heart1n2)
+
+Object_list$Heart3n4 <- doublet_finder(Object_list$Heart3n4)
+
+Object_list$Heart5 <- doublet_finder(Object_list$Heart5)
+```
+
+#Now lets remove the cells identified as doublets.
+```{r}
+remove_doublets <- function(Object){
+no_double_cells <-Object@meta.data %>% filter(!.[[ncol(Object@meta.data)]]=="Doublet") %>% rownames()
+Object <- Object[,no_double_cells]
+}
+
+Object_list <- mapply(FUN=remove_doublets,Object_list)
+```
+
+#Now create RISC objects to run integration.
+```{r}
+create_risc <- function(Object){
+#Now create RISC object with new matrix and coldata and save it.
+mat <- as.matrix(Object@assays$RNA@counts)#this step gices problem because of the size of the matrix. Has to be done in the server
+coldata <- Object@meta.data
+rowdata <- data.frame(Symbol = rownames(mat), row.names = rownames(mat))
+Object <- readsc(mat, coldata, rowdata, is.filter = T)
+return(Object)
+}
+
+```
+
+#Create new RISC objects
+```{r}
+Object_RISC <- mapply(FUN=create_risc,Object_list)
+```
+
+#Save all the filtered RISC objects
+```{r}
+save_risc <- function(object,infart_sample_list){
+saveRDS(object, file = paste0("RISC_Objects/",infart_sample_list, "_RISC.rds"))
+}
+mapply(FUN=save_risc,Object_RISC,infart_sample_list)
+```
+
+#Lets normalize and find variable genes.
+```{r}
+process0 <- function(obj0){
+#Filter. It is necessary again
+obj0 = scFilter(obj0, min.UMI = 10, max.UMI = Inf, min.gene = 1, min.cell = 1)
+# Normalize the raw counts
+obj0 = scNormalize(obj0, ncore = 4)
+# Find highly variable genes
+obj0 = scDisperse(obj0)
+# print(length(obj0@vargene))
+return(obj0)
+}
+```
+
+```{r}
+Object_RISC <- mapply(FUN=process0,Object_RISC)
+```
+#Check which of the datatsets to use as reference.
+```{r}
+var0 = Reduce(
+intersect, list(
+Object_RISC$Control1n2@rowdata$Symbol, Object_RISC$Control3n4@rowdata$Symbol, Object_RISC$Heart1n2@rowdata$Symbol, Object_RISC$Heart3n4@rowdata$Symbol,
+Object_RISC$Heart5@rowdata$Symbol 
+)
+)
+
+InPlot(Object_RISC, var.gene = var0, Std.cut = 0.99, ncore = 4, minPC = 16, nPC = 20)
+```
+#Following RISC instructions we decide Heart1n2 woukd be the reference.
+
+```{r}
+set.seed(123)
+#List to integrate the data. In this case we use Heart1n2 as reference.
+Merge_list = list(Object_RISC$Heart1n2, Object_RISC$Heart3n4, Object_RISC$Heart5, Object_RISC$Control3n4, Object_RISC$Control1n2)
+```
+
+#Integrate everything
+```{r}
+Integration_Ids <- c("Heart1n2", "Heart3n4", "Heart5", "Control3n4", "Control1n2")
+Merge_Object = scMultiIntegrate(
+objects = Merge_list, eigens = 20, add.Id = Integration_Ids, var.gene = var0,
+align = 'OLS', npc = 50, adjust = TRUE, ncore = 4
+)
+```
+
+#Since we have already orig.indentity column from Seurat, lets rename values in Set (from RISC) and create a condition colunm.
+```{r}
+Merge_Object@coldata <- Merge_Object@coldata %>% rename(Condition=Set)
+Merge_Object@coldata <- Merge_Object@coldata %>% rename(Set=orig.ident)
+
+Merge_Object@coldata$Condition <- as.character(Merge_Object@coldata$Condition)
+Merge_Object@coldata$Condition[Merge_Object@coldata$Condition=="Heart1n2"] <- "Infart"
+Merge_Object@coldata$Condition[Merge_Object@coldata$Condition=="Heart3n4"] <- "Infart"
+Merge_Object@coldata$Condition[Merge_Object@coldata$Condition=="Heart5"] <- "Infart"
+Merge_Object@coldata$Condition[Merge_Object@coldata$Condition=="Control1n2"] <- "Control"
+Merge_Object@coldata$Condition[Merge_Object@coldata$Condition=="Control3n4"] <- "Control"
+```
+
+
+```{r}
+saveRDS(Merge_Object, file = paste0("RISC_Objects/Merged_RISC.rds"))
+```
+
+#Run UMAP reduction and clustering and plot
+```{r}
+Merge_Object = scPCA(Merge_Object, npc = 20)
+Merge_Object = scUMAP(Merge_Object, npc = 20, use = "PLS")
+Merge_Object = scCluster(Merge_Object, slot = "cell.pls", neighbor = 12, method = "louvain", npc = 20)
+print(table(Merge_Object@coldata$Cluster))
+```
+
+```{r}
+DimPlot(Merge_Object, slot = "cell.umap", colFactor = "Cluster")
+```
+
+
+#Subset each sample and plot integration.
+```{r}
+plot_each_samples <- function(sample){
+  sample_cells <- Merge_Object@coldata %>% filter(orig.ident==sample) %>% rownames()
+  subset_object <- SubSet(Merge_Object, cells = sample_cells)
+  png(file =paste0("Figures/",sample, "_Integration.png"),  
+    width = 800,
+    height = 800)
+  plot <- DimPlot(subset_object, slot = "cell.umap", colFactor = "Cluster")
+  print(plot)
+  dev.off()
+}
+```
+
+```{r}
+plot_each_samples("Heart1n2")
+plot_each_samples("Heart3n4")
+plot_each_samples("Heart5")
+plot_each_samples("Control3n4")
+plot_each_samples("Control1n2")
+
+```
+
+#Since we have a separated cluster (of 31 cells) we need to remove it from the beginning and rerun everything. Will do is manually give them a new cluster assignation based on umap coordinates.
+```{r}
+umap_first_integration <- as.data.frame(Merge_Object@DimReduction$cell.umap)
+
+cell_to_remove <- umap_first_integration %>% filter(UMAP2 < -20) %>% rownames()
+```
+
+#Just create a new object (we could keep working on the original but just in case).
+```{r}
+Object_RISC2 <- Object_RISC
+```
+
+#Lets subset from Object_RISC2.
+```{r}
+remove <- cell_to_remove[grep("Heart1n2",cell_to_remove)]
+remove<- stringr::str_remove(remove, "Heart1n2_")
+all_cells <- rownames(Object_RISC2$Heart1n2@coldata)
+keep <- all_cells[!(all_cells %in% remove)]
+Object_RISC2$Heart1n2 <- SubSet(Object_RISC2$Heart1n2, cells = keep)
+
+remove <- cell_to_remove[grep("Heart3n4",cell_to_remove)]
+remove<- stringr::str_remove(remove, "Heart3n4_")
+all_cells <- rownames(Object_RISC2$Heart3n4@coldata)
+keep <- all_cells[!(all_cells %in% remove)]
+Object_RISC2$Heart3n4 <- SubSet(Object_RISC2$Heart3n4, cells = keep)
+
+remove <- cell_to_remove[grep("Heart5",cell_to_remove)]
+remove<- stringr::str_remove(remove, "Heart5_")
+all_cells <- rownames(Object_RISC2$Heart5@coldata)
+keep <- all_cells[!(all_cells %in% remove)]
+Object_RISC2$Heart5 <- SubSet(Object_RISC2$Heart5, cells = keep)
+
+remove <- cell_to_remove[grep("Control1n2",cell_to_remove)]
+remove<- stringr::str_remove(remove, "Control1n2_")
+all_cells <- rownames(Object_RISC2$Control1n2@coldata)
+keep <- all_cells[!(all_cells %in% remove)]
+Object_RISC2$Control1n2 <- SubSet(Object_RISC2$Control1n2, cells = keep)
+
+remove <- cell_to_remove[grep("Control3n4",cell_to_remove)]
+remove<- stringr::str_remove(remove, "Control3n4_")
+all_cells <- rownames(Object_RISC2$Control3n4@coldata)
+keep <- all_cells[!(all_cells %in% remove)]
+Object_RISC2$Control3n4 <- SubSet(Object_RISC2$Control3n4, cells = keep)
+
+```
+
+
+#Run everything again.
+```{r}
+process0 <- function(obj0){
+#Filter. It is necessary again
+obj0 = scFilter(obj0, min.UMI = 10, max.UMI = Inf, min.gene = 1, min.cell = 1)
+# Normalize the raw counts
+obj0 = scNormalize(obj0, ncore = 4)
+# Find highly variable genes
+obj0 = scDisperse(obj0)
+# print(length(obj0@vargene))
+return(obj0)
+}
+
+Object_RISC2 <- mapply(FUN=process0,Object_RISC2)
+```
+#Lets start with the integration.
+```{r}
+var0 = Reduce(
+intersect, list(
+Object_RISC2$Control1n2@rowdata$Symbol, Object_RISC2$Control3n4@rowdata$Symbol, Object_RISC2$Heart1n2@rowdata$Symbol, Object_RISC2$Heart3n4@rowdata$Symbol,
+Object_RISC2$Heart5@rowdata$Symbol 
+)
+)
+
+InPlot(Object_RISC2, var.gene = var0, Std.cut = 0.99, ncore = 4, minPC = 16, nPC = 20)
+```
+
+
+```{r}
+set.seed(123)
+#List to integrate the data. In this case we use Heart1n2 as reference.
+Merge_list = list(Object_RISC2$Heart1n2, Object_RISC2$Heart3n4, Object_RISC2$Heart5, Object_RISC2$Control3n4, Object_RISC2$Control1n2)
+```
+
+#Integrate again.
+```{r}
+Integration_Ids <- c("Heart1n2", "Heart3n4", "Heart5", "Control3n4", "Control1n2")
+Merge2_Object = scMultiIntegrate(
+objects = Merge_list, eigens = 20, add.Id = Integration_Ids, var.gene = var0,
+align = 'OLS', npc = 50, adjust = TRUE, ncore = 4
+)
+```
+
+#Create a condition colunm.
+```{r}
+Merge2_Object@coldata <- Merge2_Object@coldata %>% rename(Condition=Set)
+Merge2_Object@coldata <- Merge2_Object@coldata %>% rename(Set=orig.ident)
+Merge2_Object@coldata$Condition <- as.character(Merge2_Object@coldata$Condition)
+Merge2_Object@coldata$Condition[Merge2_Object@coldata$Condition=="Heart1n2"] <- "Infart"
+Merge2_Object@coldata$Condition[Merge2_Object@coldata$Condition=="Heart3n4"] <- "Infart"
+Merge2_Object@coldata$Condition[Merge2_Object@coldata$Condition=="Heart5"] <- "Infart"
+Merge2_Object@coldata$Condition[Merge2_Object@coldata$Condition=="Control1n2"] <- "Control"
+Merge2_Object@coldata$Condition[Merge2_Object@coldata$Condition=="Control3n4"] <- "Control"
+
+saveRDS(Merge2_Object, file = paste0("RISC_Objects/Merged2_RISC.rds"))
+```
+
+#Lets run UMAP reduction.
+```{r}
+Merge2_Object = scUMAP(Merge2_Object, npc = 20, use = "PLS")
+
+Merge2_Object = scCluster(Merge2_Object, slot = "cell.pls", neighbor = 12, method = "louvain", npc = 20)
+print(table(Merge2_Object@coldata$Cluster))
+
+DimPlot(Merge2_Object, slot = "cell.umap", colFactor = "Cluster")
+```
+
+#In order to plot Control and Hearts UMAP I need to subset the data. Cluster 2 is not present in Contorl so it will fail when plotting by colors. Change one of the cells in Control to Cluster 2.
+```{r}
+Merge2_Object@coldata["Control1n2_GCCAGCATCGATTCCC-1",]$Cluster <- 2
+Merge2_Object@coldata["Control3n4_TGAGCGCAGAAGCCTG-1",]$Cluster <- 2
+```
+
+
+#Subset each sample and plot integration.
+```{r}
+plot_each_samples <- function(sample){
+  sample_cells <- Merge2_Object@coldata %>% filter(Set %in% sample) %>% rownames()
+  subset_object <- SubSet(Merge2_Object, cells = sample_cells)
+  png(file =paste0("Integration2_Figures/",sample, "_Integration2_new_colors.png"),  
+    width = 800,
+    height = 800)
+  plot <- RISC::DimPlot(subset_object, slot = "cell.umap", colFactor = "Cluster", Colors = c("#00008b", "gray", "#00BA38", "#00BFC4", "#C77CFF", "brown", "#7CAE00", "#F8766D", "#F564E3", "#fadadd", "#B79F00", "#DE8C00"))
+  print(plot)
+  dev.off()
+}
+```
+
+```{r}
+plot_each_samples("Heart1n2")
+plot_each_samples("Heart3n4")
+plot_each_samples("Heart5")
+plot_each_samples("Control3n4")
+plot_each_samples("Control1n2")
+plot_each_samples(c("Control1n2","Control3n4"))
+plot_each_samples(c("Heart1n2","Heart3n4","Heart5"))
+
+```
+
+
+#Run marker identification for each cluster.
+```{r}
+Integrated2_markers <- AllMarker(
+    Merge2_Object,
+    positive = FALSE,
+    frac = 0.25,
+    log2FC = 0.25,
+    Padj = 0.01,
+    latent.factor = NULL,
+    min.cells = 25L,
+    method = "Wilcox",
+    ncore = 1
+)
+write.csv(Integrated2_markers, "Integrated2_marker_df/Integrated2_markers.csv", row.names = F)
+```
+
+#Plot top markers.
+```{r}
+integration_draw_heatmap <- function(dataframe,obejct){
+  pdf(file =paste0("Integration2_Figures/Integration2_top10markers_heatmap.pdf"),  
+      width = 8,
+      height = 15)
+  dataframe %>%
+    group_by(Cluster) %>%
+    top_n(n = 10, wt = log2FC) -> top5
+plot <- Heat(obejct, colFactor = "Cluster",genes  = top5$Symbol, smooth="smooth", gene.lab = T,  num=10, gene.lab.size = 10) 
+print(plot)
+dev.off()
+}
+integration_draw_heatmap(Integrated2_markers,Merge2_Object)
+```
+
+#Plot markers of interest.
+```{r}
+markers_to_plot_2 <- c("Cspg4","Myh11","Acta2","Mylk","Myl9","Smtn","Tagln","Mcam","Pdgfrb","Cspg4", "Rgs5" ,"Vtn","Ifitm1","Kcnj8","Cd248","Anpep", "Des", "Dlk1", "Zic1", "Abcc9", "Notch3","Pdgfra" , "Tcf21", "Col1a1", "Col3a1","Fbln1", "Fbln2", "Loxl1", "Postn" , "Acta2" , "S100a4", "Fap","Vim" ,"Ptprc" , "Cdh5", "Adgre1" ,"Tnnt1", "Tnnt2", "Actc1", "Myh7") 
+```
+
+```{r}
+Heat(Merge2_Object, colFactor = "Cluster",genes  = markers_to_plot_2, smooth="smooth", gene.lab = T,  num=10, gene.lab.size = 10) 
+```
+
+#Count number of cells in each cluster for each sample
+```{r}
+Merge2_metadata <- Merge2_Object@coldata
+clusters <- unique(Merge2_metadata$Cluster)
+Set_cluster_number <- data.frame(Var1=clusters)
+for ( i in unique(Merge2_metadata$Set)){
+  Merge2_metadata_set <- Merge2_metadata %>% filter(Set==i)
+  cluster_table <- as.data.frame(table(Merge2_metadata_set$Cluster))
+  cluster_table <- cluster_table %>% dplyr::rename(!!paste0(i) := Freq)
+  Set_cluster_number <- join(Set_cluster_number,cluster_table, type="inner")
+}
+Set_cluster_number <- Set_cluster_number %>% dplyr::rename(Cluster = Var1)
+write.csv(Set_cluster_number, "Integrated2_marker_df/Sample_cluster_number.csv", row.names = F)
+```
+
+#Run DE analysis for each of the Clusters.
+```{r}
+DE_function <- function(reference, case){
+  DE <- data.frame()
+  for (celltype in unique(Merge2_Object@coldata$Cluster)){
+    tryCatch ( {
+      cell1 = rownames(Merge2_Object@coldata)[Merge2_Object@coldata$Cluster == celltype & Merge2_Object@coldata$Condition %in% reference]
+      cell2 = rownames(Merge2_Object@coldata)[Merge2_Object@coldata$Cluster == celltype & Merge2_Object@coldata$Condition %in% case]
+      DE0 = scDEG(Merge2_Object, cell.ctrl = cell1, cell.sam = cell2, ncore = 4, frac = 0.1, Padj = 0.05, log2FC = 0.25, method = "Wilcox")
+      Cluster <- data.frame(Cluster=rep(paste0(celltype), nrow(DE0)))
+      DE1 <- cbind(DE0,Cluster)
+      DE <- rbind(DE,DE1)
+    },error=function(e){cat("ERROR :",conditionMessage(e), "\n")} )
+  }
+return(DE)
+}
+```
+
+```{r}
+Nikolaos_Integrated2_DE <- DE_function("Control","Infart")
+```
+
+
+#Run DE as pseudo-bulk RNAseq using edgeR. For that create a new count table summing cells coming from same sample. Since RISC doesnt save raw data I need to go back to seurat and subset the data again.
+#Raw counts (doublets are removed). We need to remove only those cells that were in a separated cluster.
+```{r}
+raw_control1n2 <- Object_list$Control1n2@assays$RNA@counts
+raw_control3n4 <- Object_list$Control3n4@assays$RNA@counts
+raw_heart1n2 <- Object_list$Heart1n2@assays$RNA@counts
+raw_heart3n4 <- Object_list$Heart3n4@assays$RNA@counts
+raw_heart5 <- Object_list$Heart5@assays$RNA@counts
+```
+
+#metadata to get cells for each cluster.
+```{r}
+Merge2_metadata <- Merge2_Object@coldata
+```
+
+#Create function to remove cells and then get a df with sample and celltype.
+```{r}
+pseudo_bulk_df <- function(sample,raw_counts_sample){
+remove <- cell_to_remove[grep(paste0(sample,"_"),cell_to_remove)]
+remove<- stringr::str_remove(remove, paste0(sample,"_"))
+raw_counts_sample <- raw_counts_sample[, !(colnames(raw_counts_sample) %in% remove)]
+subset_metadata <- Merge2_metadata %>% filter(Set==sample)
+sample_pseudo_bulk <- as.data.frame(rownames(raw_counts_sample))
+  for ( i in unique(subset_metadata$Cluster)){
+    cell_clusters <- subset_metadata %>% filter(Cluster==i) %>% select(scBarcode)
+    cell_clusters <- cell_clusters$scBarcode
+      if( isTRUE(length(cell_clusters) > 1)){
+      subseted_raw <- raw_counts_sample[,cell_clusters]
+      #subseted_raw <- as.data.frame(subseted_raw)
+      Cluster_sum <- as.data.frame(rowSums(subseted_raw))
+      Cluster_sum <- Cluster_sum %>% dplyr::rename(!!paste0(sample,"_Cluster",i) := 1)
+      rownames(Cluster_sum) <- NULL
+      #print(colnames(Cluster_sum))
+      sample_pseudo_bulk <- cbind(sample_pseudo_bulk,Cluster_sum)
+      }
+  }
+return(sample_pseudo_bulk)
+}
+```
+
+```{r}
+Control1n2_pseudo_bulk <- pseudo_bulk_df("Control1n2", raw_control1n2)
+
+Control3n4_pseudo_bulk <- pseudo_bulk_df("Control3n4", raw_control3n4)
+
+Heart1n2_pseudo_bulk <- pseudo_bulk_df("Heart1n2", raw_heart1n2)
+
+Heart3n4_pseudo_bulk <- pseudo_bulk_df("Heart3n4", raw_heart3n4)
+
+Heart5_pseudo_bulk <- pseudo_bulk_df("Heart5", raw_heart5)
+
+```
+#Now bind all df
+```{r}
+all_psuedo_list <- list(Control1n2_pseudo_bulk,Control3n4_pseudo_bulk,Heart1n2_pseudo_bulk,Heart3n4_pseudo_bulk,Heart5_pseudo_bulk)
+```
+
+```{r}
+all_pseudo_bulk_counts <- join_all(all_psuedo_list,type = "full", match = "all")
+all_pseudo_bulk_counts[is.na(all_pseudo_bulk_counts)] <- 0
+rownames(all_pseudo_bulk_counts) <- all_pseudo_bulk_counts$`rownames(raw_counts_sample)`
+all_pseudo_bulk_counts$`rownames(raw_counts_sample)` <- NULL
+write.csv(all_pseudo_bulk_counts, "Pseudo_bulk_raw_counts.csv", row.names = T)
+```
+#Remove Cluster2, Cluster7, Cluster8  Cluster9 and Cluster11 because tehere is not enougth data for Controls.
+```{r}
+subset_pseudo_bulk <- all_pseudo_bulk_counts %>% select(-contains(c("Cluster2","Cluster7","Cluster8","Cluster9", "Cluster11")))
+
+```
+
+#Create function to run edgeR for each Cluster.
+https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf
+
+```{r}
+edgeR_cluster <- function(Cluster_name){
+  subset2_pseudo_bulk <- subset_pseudo_bulk %>% select(ends_with(Cluster_name))
+  Sample_name <- colnames(subset2_pseudo_bulk)
+  Cluster_number <- vapply(strsplit(Sample_name, "_", fixed = TRUE), "[", "", 2)
+  Condition <- gsub("[0-9].*","",Sample_name)
+  pseud_bulk_md <- data.frame(Sample_name,Cluster_number,Condition)
+  rownames(pseud_bulk_md) <- pseud_bulk_md$Sample_name
+  pseud_bulk_md$Condition <- as.factor(pseud_bulk_md$Condition)
+  y <- DGEList(counts = subset2_pseudo_bulk, group = pseud_bulk_md$Condition)
+  keep <- filterByExpr(y)
+  y <- y[keep, , keep.lib.sizes=FALSE]
+  y <- calcNormFactors(y)
+  design <- model.matrix(~pseud_bulk_md$Condition)
+  y <- estimateDisp(y,design)
+  fit <- glmQLFit(y, design, robust = TRUE)
+  fit <- glmQLFTest(fit, coef=2)
+  results <- as.data.frame(topTags(fit, n=2000))
+  results$Gene <- as.character(rownames(results))
+  results <- results %>% arrange((FDR))
+  results <- results %>% select(Gene, everything())
+  Cluster <- data.frame(Cluster=rep(paste0(Cluster_name), nrow(results)))
+  results <- cbind(results,Cluster)
+  return(results)
+}
+
+```
+
+#Now create the metadata table to create edgeR object.
+```{r}
+Cluster1_pseudo_bulk_DE <- edgeR_cluster("Cluster1")
+Cluster3_pseudo_bulk_DE <- edgeR_cluster("Cluster3")
+Cluster4_pseudo_bulk_DE <- edgeR_cluster("Cluster4")
+Cluster5_pseudo_bulk_DE <- edgeR_cluster("Cluster5")
+Cluster6_pseudo_bulk_DE <- edgeR_cluster("Cluster6")
+Cluster10_pseudo_bulk_DE <- edgeR_cluster("Cluster10")
+Cluster12_pseudo_bulk_DE <- edgeR_cluster("Cluster12")
+
+```
+
+
+```{r}
+pseudo_bulk_de_list <-list( Cluster1_pseudo_bulk_DE,Cluster3_pseudo_bulk_DE,Cluster4_pseudo_bulk_DE,Cluster5_pseudo_bulk_DE,Cluster6_pseudo_bulk_DE,Cluster10_pseudo_bulk_DE,Cluster12_pseudo_bulk_DE)
+DE_psuedo_bulk <- do.call(rbind,pseudo_bulk_de_list)
+```
+
+```{r}
+write.csv(DE_psuedo_bulk, "DE2_psuedo_bulk_Infart.csv", row.names = T, col.names = T)
+```
+
+# 2 UMAP fromc ontrols samples and infarts.
+```{r}
+for(i in unique(Merge2_Object@coldata$Condition)){
+  sample_cells <- Merge2_Object@coldata %>% filter(Condition==i) %>% rownames()
+  subset_object <- SubSet(Merge2_Object, cells = sample_cells)
+  png(file =paste0("Integration2_Figures/",i, "_Integration2.png"),  
+    width = 800,
+    height = 800)
+  plot <- DimPlot(subset_object, slot = "cell.umap", colFactor = "Cluster")
+  plot <- plot + ggtitle(paste0(i, " hearts UMAP"))
+  print(plot)
+  dev.off()
+}
+```
+
+#We need information of UMAP coordinates to run scvelo and cellrank.
+```{r}
+metadata_file <- Merge2_Object@coldata
+metadata_file$UMAP1 <- (Merge2_Object@DimReduction$cell.umap)[,1]
+metadata_file$UMAP2 <- (Merge2_Object@DimReduction$cell.umap)[,2]
+write.csv(metadata_file, "Infart_RISC_metadata.csv")
+```
+
+#Plot top 5 markers data.
+```{r}
+Integrated2_markers %>%
+  group_by(Cluster) %>%
+  top_n(n = 5, wt = log2FC) -> Integrated2_markers_top5
+
+colors_for_paper=list(c("1"="#00008b", "2"="gray", "3"="#00BA38", "4"="#00BFC4","5"= "#C77CFF","6"= "brown","7"= "#7CAE00","8"= "#F8766D","9"= "#F564E3","10"= "#fadadd","11"= "#B79F00","12"= "#DE8C00"))
+
+Heat(Merge2_Object, colFactor = "Cluster",genes  = Integrated2_markers_top5$Symbol, smooth="smooth", gene.lab = T,  num=10, gene.lab.size = 10, ann_col=colors_for_paper)
+```
+
