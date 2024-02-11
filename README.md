@@ -1,5 +1,5 @@
-# circulation_sn_code
-Scripts used for the integration and analysis of single nuclear RNA-Seq samples from Alex et al. [**PMID: 37350296**]
+# circulation_snRNA-Seq_code
+Scripts used for the integration and analysis of single nuclear RNA-Seq samples from Alex et al. [PMID: 37350296](https://pubmed.ncbi.nlm.nih.gov/37350296/) 
 
 ## Bioinformatics Methods
 
